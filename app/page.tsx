@@ -25,11 +25,100 @@ export default function Home() {
     lLower?: { x:number; y:number; z:number };
   }>({ captured: false });
 
+  function easeInOutSine(x: number) {
+    // 0→1 を滑らかに
+    return 0.5 - 0.5 * Math.cos(Math.PI * clamp01(x));
+  }
+
+  function clamp(x: number, a: number, b: number) {
+    return Math.max(a, Math.min(b, x));
+  }
+
+  function clampEulerZXY(node: any, lim: {x?:[number,number], y?:[number,number], z?:[number,number]}) {
+    if (!node) return;
+    if (lim.x) node.rotation.x = clamp(node.rotation.x, lim.x[0], lim.x[1]);
+    if (lim.y) node.rotation.y = clamp(node.rotation.y, lim.y[0], lim.y[1]);
+    if (lim.z) node.rotation.z = clamp(node.rotation.z, lim.z[0], lim.z[1]);
+  }
+
+  function pickWeighted<T extends string>(items: ReadonlyArray<readonly [T, number]>): T {
+    const total = items.reduce((s, [, w]) => s + w, 0);
+    let r = Math.random() * total;
+    for (const [v, w] of items) {
+      r -= w;
+      if (r <= 0) return v;
+    }
+    return items[items.length - 1][0];
+  }
+
+  type BonePose = { x: number; y: number; z: number };
+
+
+  type GestureKind =
+    | "nod"
+    | "wave"
+    | "tilt"
+    | "shake"
+    | "shrug"
+    | "smallWave"
+    | "cheer"
+    | "waveOverhead"
+    | "none";
+
+  type GestureState = {
+    kind: GestureKind;
+    until: number;
+    strength?: number;
+  };
+
   // ★ここに入れる（talkIdRefの直後）
-  const gestureRef = useRef<{ until: number; kind: "nod" | "wave" | "none" }>({
-    until: 0,
+  const gestureRef = useRef<GestureState>({
     kind: "none",
+    until: 0,
+    strength: 1.0,
   });
+
+  function setGesture(kind: GestureKind, ms = 1200, strength = 1.0) {
+    gestureRef.current = {
+      kind,
+      until: performance.now() + ms,
+      strength,
+    };
+  }
+
+
+  function triggerGestureFromText(text: string) {
+    // 挨拶/別れ
+    if (/(こんにちは|おはよう|こんばんは|またね|ばいばい|バイバイ)/.test(text)) {
+      setGesture("smallWave", 1400, 1.0);
+      return;
+    }
+
+    // 困り/迷い
+    if (/(わから|分から|うーん|困|微妙|たぶん|かも)/.test(text)) {
+      const kind = pickWeighted([["shrug", 0.5], ["tilt", 0.5]] as const);
+      setGesture(kind, 1400, 0.9);
+      return;
+    }
+
+    // 否定
+    if (/(違い|ちがい|できません|無理|むり|難しい|だめ)/.test(text)) {
+      setGesture("shake", 1200, 0.9);
+      return;
+    }
+
+    // 喜び/称賛
+    if (/(やった|すごい|おめでとう|最高|天才|成功)/.test(text)) {
+      const kind = pickWeighted([["waveOverhead", 0.6], ["cheer", 0.4]] as const);
+      setGesture(kind, 1600, 1.1);
+      return;
+    }
+
+    // fallback
+    const fallback = pickWeighted([["nod", 0.60], ["tilt", 0.25], ["smallWave", 0.15]] as const);
+    setGesture(fallback, 1100, 0.6);
+  }
+
 
   type BasePose = {
   hipsY: number;
@@ -47,6 +136,9 @@ export default function Home() {
     { role: "assistant", content: "こんにちは。何について話しましょうか？" },
   ]);
   const [input, setInput] = useState("");
+  const [isListening, setIsListening] = useState(false);
+  const [interimText, setInterimText] = useState(""); // 途中結果（任意）
+  const recognitionRef = useRef<any>(null);
   const [busy, setBusy] = useState(false);
   type SpeakerItem = {
     name: string;
@@ -55,7 +147,7 @@ export default function Home() {
   };
 
   const [speakers, setSpeakers] = useState<SpeakerItem[]>([]);
-  const [speakerId, setSpeakerId] = useState<number>(1);
+  const [speakerId, setSpeakerId] = useState<number>(66);
   const [speakerFilter, setSpeakerFilter] = useState<string>("");
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -67,7 +159,61 @@ export default function Home() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, busy]);
 
-  function triggerGesture(kind: "nod" | "wave", ms = 900) {
+  useEffect(() => {
+    // Next/app でも一応ガード（"use client" なので基本は動く）
+    if (typeof window === "undefined") return;
+
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) {
+      console.warn("SpeechRecognition not supported in this browser.");
+      return;
+    }
+
+    const rec = new SR();
+    rec.lang = "ja-JP";
+    rec.continuous = true;       // 長めに話すなら true
+    rec.interimResults = true;   // 途中結果を取る
+    rec.maxAlternatives = 1;
+
+    rec.onresult = (event: any) => {
+      let interim = "";
+      let final = "";
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const txt = event.results[i][0].transcript;
+        if (event.results[i].isFinal) final += txt;
+        else interim += txt;
+      }
+
+      if (interim) setInterimText(interim);
+
+      if (final) {
+        setInterimText("");
+        // 入力欄へ追記（置換にしたいなら prev を捨てて final だけに）
+        setInput((prev) => (prev ? prev + " " : "") + final.trim());
+      }
+    };
+
+    rec.onend = () => {
+      setIsListening(false);
+      setInterimText("");
+    };
+
+    rec.onerror = (e: any) => {
+      console.warn("SpeechRecognition error:", e);
+      setIsListening(false);
+      setInterimText("");
+    };
+
+    recognitionRef.current = rec;
+
+    return () => {
+      try { rec.stop(); } catch {}
+    };
+  }, []);
+
+
+  function triggerGesture(kind: "nod" | "wave" | "tilt" | "shake" | "shrug" | "smallWave" | "cheer" , ms = 900) {
     gestureRef.current = { kind, until: performance.now() + ms };
   }
 
@@ -83,40 +229,175 @@ export default function Home() {
     const lLA = hum.getNormalizedBoneNode("leftLowerArm");
 
     // 肩：少しだけ下げる（モデル依存が少ない範囲）
-    if (rS) rS.rotation.z = -0.15;
-    if (lS) lS.rotation.z =  0.15;
+    if (rS) rS.rotation.z = -0.25;
+    if (lS) lS.rotation.z =  0.25;
 
     // 上腕：軽く前に/下に（大きく回さない）
-    if (rUA) { rUA.rotation.x = 0.25; rUA.rotation.z = -0.55; }
-    if (lUA) { lUA.rotation.x = 0.25; lUA.rotation.z =  0.55; }
+    if (rUA) { rUA.rotation.x = 0.25; rUA.rotation.z = 1.5; }
+    if (lUA) { lUA.rotation.x = 0.25; lUA.rotation.z =  -1.5; }
 
     // 前腕：少し曲げる（手が体に刺さりにくくなる）
-    if (rLA) { rLA.rotation.x = -0.15; rLA.rotation.z = -0.10; }
-    if (lLA) { lLA.rotation.x = -0.15; lLA.rotation.z =  0.10; }
+    if (rLA) { rLA.rotation.x = -0.1; rLA.rotation.y = 0.5; rLA.rotation.z = -0.10; }
+    if (lLA) { lLA.rotation.x = -0.1; lLA.rotation.y = -0.5; lLA.rotation.z =  -0.10; }
   }
 
 
-  /** gesture（うなずき/手振り） ※必ずベース + 差分で上書き */
+  /** gesture（うなずき/手振り/他） ※必ずベース + 差分で上書き */
   function applyGesture(vrm: any, t: number) {
     const b = basePoseRef.current;
     if (!vrm || !b?.captured) return;
 
     const g = gestureRef.current;
-    if (performance.now() > g.until) return;
+    if (!g || performance.now() > g.until) return;
 
-    const neck = vrm.humanoid?.getNormalizedBoneNode?.("neck");
-    const rUA  = vrm.humanoid?.getNormalizedBoneNode?.("rightUpperArm");
-    const rLA  = vrm.humanoid?.getNormalizedBoneNode?.("rightLowerArm");
+    const hum = vrm.humanoid;
+    const get = hum?.getNormalizedBoneNode?.bind(hum);
+    if (!get) return;
 
+    const neck = get("neck");
+    const spine = get("spine");
+    const chest = get("chest"); // ないモデルもある
+    const rS = get("rightShoulder");
+    const lS = get("leftShoulder");
+    const rUA = get("rightUpperArm");
+    const rLA = get("rightLowerArm");
+    const lUA = get("leftUpperArm");
+    const lLA = get("leftLowerArm");
+
+    // 強さ（任意：g.strength がなければ 1.0）
+    const k = typeof g.strength === "number" ? g.strength : 1.0;
+
+    // ---- nod（既存） ----
     if (g.kind === "nod" && neck && b.neck) {
-      neck.rotation.x = b.neck.x + Math.sin(t * 10) * 0.12;
+      neck.rotation.x = b.neck.x + Math.sin(t * 10) * 0.12 * k;
+      return;
     }
 
+    // ---- tilt：首かしげ（会話で使いやすい） ----
+    if (g.kind === "tilt" && neck && b.neck) {
+      neck.rotation.z = b.neck.z + Math.sin(t * 6) * 0.16 * k;
+      clampEulerZXY(neck, { x: [-0.35, 0.35] });
+      return;
+    }
+
+    // ---- shake：首ふり（軽い否定） ----
+    if (g.kind === "shake" && neck && b.neck) {
+      neck.rotation.y = b.neck.y + Math.sin(t * 8) * 0.20 * k;
+      clampEulerZXY(neck, { y: [-0.45, 0.45] });
+      return;
+    }
+
+    // ---- shrug：肩すくめ（困り/照れ） ----
+    if (g.kind === "shrug") {
+      // 肩を少し上げる感じ：肩のzを少し寄せて、上半身もほんの少し動かす
+      const s = (Math.sin(t * 10) * 0.01) * k; // 上げっぱなし寄り
+      if (rS) rS.rotation.z = (rS.rotation.z ?? 0) - s;
+      if (lS) lS.rotation.z = (lS.rotation.z ?? 0) + s;
+      return;
+    }
+
+    // ---- smallWave：控えめ手振り（貫通しにくい） ----
+    if (g.kind === "smallWave" && rUA && rLA && b.rUpper && b.rLower) {
+      const s1 = Math.sin(t * 10);
+      const s2 = Math.sin(t * 14);
+
+      // 体の外側に逃がす（貫通防止）
+      rUA.rotation.y = (b.rUpper.y ?? 0) - 0.15 * k;
+      rUA.rotation.x = (b.rUpper.x ?? 0) - 0.10 * k;
+
+      // 振り幅は小さく
+      rUA.rotation.z = b.rUpper.z + s1 * 0.12 * k;
+      rLA.rotation.z = b.rLower.z + s2 * 0.10 * k;
+
+      // 肘を少し曲げる（見栄え＆貫通防止）
+      rLA.rotation.x = (b.rLower.x ?? 0) - 0.65 * k;
+
+
+      // ★角度上限（人外防止）
+      clampEulerZXY(rUA, { x: [-1.2, 0.6], y: [-1.0, 1.0], z: [-2.2, 2.2] });
+      clampEulerZXY(rLA, { x: [-1.6, 0.2], z: [-1.2, 1.2] });
+      return;
+    }
+
+    // ---- wave（既存の手振り：安全版に置き換え推奨） ----
     if (g.kind === "wave" && rUA && rLA && b.rUpper && b.rLower) {
-      rUA.rotation.z = b.rUpper.z + Math.sin(t * 12) * -0.35;
-      rLA.rotation.z = b.rLower.z + Math.sin(t * 16) * -0.25;
+      const s1 = Math.sin(t * 12);
+      const s2 = Math.sin(t * 16);
+
+      // 外側/前へ逃がす（ここが重要）
+      rUA.rotation.y = (b.rUpper.y ?? 0) - 0.20 * k;
+      rUA.rotation.x = (b.rUpper.x ?? 0) - 0.12 * k;
+
+      // 振り
+      rUA.rotation.z = b.rUpper.z + s1 * 0.18 * k;
+      rLA.rotation.z = b.rLower.z + s2 * 0.12 * k;
+
+      // 肘：もう少し曲げたいならここを強める
+      rLA.rotation.x = (b.rLower.x ?? 0) - 0.75 * k;
+
+      clampEulerZXY(rUA, { x: [-1.2, 0.6], y: [-1.0, 1.0], z: [-2.2, 2.2] });
+      clampEulerZXY(rLA, { x: [-1.6, 0.2], z: [-1.2, 1.2] });
+      return;
+    }
+
+    // ---- waveOverhead：両手を頭上で振る（リアクション向け） ----
+    if (g.kind === "waveOverhead") {
+      const s = Math.sin(t * 10);
+      const sFast = Math.sin(t * 18);
+
+      // 上半身もほんの少し“ノる”
+      if (spine && b.spine) spine.rotation.y = (b.spine.y ?? 0) + s * 0.05 * k;
+
+      const setOver = (UA: any, LA: any, side: 1 | -1, bu?: any, bl?: any) => {
+        if (!UA || !LA) return;
+        const _bu = bu ?? { x: 0, y: 0, z: 0 };
+        const _bl = bl ?? { x: 0, y: 0, z: 0 };
+
+        // ★腕を上げる：モデルによって x と z が逆に効くことがある
+        // あなたのモデルは z が強く効く可能性が高いので、まず z で上げる版にしておく
+        UA.rotation.z = (_bu.z ?? 0) + side * 1.05 * k;     // 上げる
+        UA.rotation.y = (_bu.y ?? 0) + side * 0.30 * k;     // 外に開く
+        UA.rotation.x = (_bu.x ?? 0) - 0.10 * k;            // 少し前
+
+        // 頭上で振る（軽く）
+        UA.rotation.y += sFast * 0.12 * k;
+
+        // 肘を伸ばし気味
+        LA.rotation.x = (_bl.x ?? 0) - 0.10 * k;
+        LA.rotation.z = (_bl.z ?? 0) + sFast * 0.10 * k;
+      };
+
+      setOver(rUA, rLA,  1, b.rUpper, b.rLower);
+      setOver(lUA, lLA, -1, b.lUpper, b.lLower);
+
+      // ★頭上は“特に”人外になりやすいので強めにクランプ
+      clampEulerZXY(rUA, { x: [-1.4, 0.8], y: [-1.2, 1.2], z: [-2.0, 2.0] });
+      clampEulerZXY(lUA, { x: [-1.4, 0.8], y: [-1.2, 1.2], z: [-2.0, 2.0] });
+      clampEulerZXY(rLA, { x: [-0.6, 0.4] });
+      clampEulerZXY(lLA, { x: [-0.6, 0.4] });
+      return;
+    }
+
+    // ---- cheer：片手ガッツポーズ（貫通少なめ） ----
+    if (g.kind === "cheer" && rUA && rLA && b.rUpper && b.rLower) {
+      const s = Math.sin(t * 10);
+
+      // 上げる（モデル依存：まず z で）
+      rUA.rotation.z = (b.rUpper.z ?? 0) + 1.2 * k;
+      rUA.rotation.y = (b.rUpper.y ?? 0) - 0.15 * k;
+
+      // 肘は曲げる
+      rLA.rotation.x = (b.rLower.x ?? 0) - 0.85 * k;
+
+      // 小さく揺らす
+      rLA.rotation.z = (b.rLower.z ?? 0) + s * 0.10 * k;
+
+      clampEulerZXY(rUA, { x: [-1.2, 0.8], y: [-1.0, 1.0], z: [-2.0, 2.0] });
+      clampEulerZXY(rLA, { x: [-1.6, 0.2], z: [-1.0, 1.0] });
+      return;
     }
   }
+
 
 
   function readRot(n: any) {
@@ -147,7 +428,6 @@ export default function Home() {
 
     b.captured = true;
   }
-
 
 
   /** 毎フレーム「必ずベースに戻す」 */
@@ -398,8 +678,6 @@ export default function Home() {
       renderer.render(scene, camera);
     };
 
-
-
     animate();
 
     const onResize = () => {
@@ -499,7 +777,8 @@ export default function Home() {
         clearEmotion(vrm);
         setExpression(vrm, emo, 0.8);
 
-        triggerGesture(Math.random() < 0.6 ? "nod" : "wave", 900);
+        //triggerGesture(Math.random() < 0.6 ? "nod" : "wave": "tilt" : "shake" : "shrug" : "smallWave" : "cheer" , 900);
+        triggerGestureFromText(text);
 
         startMouth(text);
       };
@@ -603,6 +882,30 @@ export default function Home() {
     }
   };
 
+  function startListening() {
+    const rec = recognitionRef.current;
+    if (!rec) return;
+    try {
+      setInterimText("");
+      rec.start();
+      setIsListening(true);
+    } catch (e) {
+      // start連打で例外になることがある
+      console.warn(e);
+    }
+  }
+
+  function stopListening() {
+    const rec = recognitionRef.current;
+    if (!rec) return;
+    try {
+      rec.stop();
+    } catch (e) {
+      console.warn(e);
+    }
+    setIsListening(false);
+    setInterimText("");
+  }
 
   // ---- Send message ----
   const send = async () => {
@@ -813,6 +1116,24 @@ export default function Home() {
               outline: "none",
             }}
           />
+
+          {/* ★追加：音声入力ボタン */}
+          <button
+            onClick={isListening ? stopListening : startListening}
+            style={{
+              padding: "10px 12px",
+              borderRadius: 10,
+              border: "1px solid rgba(255,255,255,0.15)",
+              background: isListening ? "rgba(255,80,80,0.22)" : "rgba(255,255,255,0.06)",
+              color: "white",
+              cursor: "pointer",
+              minWidth: 44,
+            }}
+            title={isListening ? "音声入力を停止" : "音声入力を開始"}
+          >
+            {isListening ? "■" : "🎤"}
+          </button>
+
           <button
             onClick={send}
             disabled={!canSend}
